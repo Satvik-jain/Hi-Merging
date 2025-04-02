@@ -49,6 +49,6 @@ Contains various medical-related datasets for fine-tuning and evaluation:
 
 Command-line scripts to automate the merging experiments and analysis:
 
-- `run_layer_test.sh`: Layer-wise model analysis script
+- `run_model_wise.sh`: Script for model-wise pruning and scaling
 - `run_single_contribution.sh`: Script evaluating single-layer contributions and impacts before merging
 - `run_merge_contribution.sh`: Script running contribution analysis after merging
