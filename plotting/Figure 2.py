@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 更新后的数据
+# test set performance
 density = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 weight = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 values = np.array([
@@ -20,19 +20,19 @@ values = np.array([
 
 
 
-# 创建热力图
+# creat heat map
 plt.figure(figsize=(5, 4))
 sns.heatmap(values, annot=False, fmt=".4f", cmap='YlGnBu', xticklabels=density, yticklabels=weight)
 
-# 添加标签和标题
+# add labels
 # plt.title('Heatmap with Values')
 plt.xlabel(r'$s$')
 plt.ylabel(r'$p$')
 
-# 显示图形
+# show fig
 # plt.show()
 
-# 保存PDF
+# save PDF
 plt.savefig('./data/Figure 2.pdf')
 
 
