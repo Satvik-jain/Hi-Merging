@@ -1,4 +1,4 @@
-# LLM-Merging
+# Hi-Merging
 
 
 ## Overview
