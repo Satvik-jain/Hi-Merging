@@ -18,9 +18,9 @@ This section provides a step-by-step guide on how to use this repository to fine
 1.  **Clone the Repository:**
 
     ```bash
-    https://anonymous.4open.science/r/hi-merging/README.md
+    git clone https://github.com/Fzkuji/Hi-Merging.git
     ```
-2.  **Set up Environment:** Ensure you have Python (e.g., 3.9-3.12), PyTorch, and CUDA (e.g., 11.8 or 12.4) installed.
+2.  **Set up Environment:** Ensure you have Python (e.g., 3.9 - 3.12), PyTorch, and CUDA (e.g., 11.8 or 12.4) installed.
 3.  **LLaMA Factory & MergeKit:** This project relies on [LLaMA Factory](https://github.com/hiyouga/LLaMA-Factory) for fine-tuning and [MergeKit](https://github.com/cg123/mergekit) for the merging backbone. Ensure they are correctly installed and accessible, potentially via submodules or separate installations referenced in your scripts. Update paths in configuration files (e.g., `scripts/run_*.sh`).
 
 
