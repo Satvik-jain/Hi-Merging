@@ -28,72 +28,84 @@ mkdir -p "$(dirname "$OUTPUT_JSON")"
 python3 -c "
 import torch
 import json
+import os
 from transformers import AutoModelForCausalLM
 import numpy as np
 
 def analyze_merge_contribution(merged_model_path, base_model_path, output_json):
     print('Loading models...')
-    # Load models with half precision to save memory
-    merged = AutoModelForCausalLM.from_pretrained(
-        merged_model_path, 
-        device_map='auto',
-        torch_dtype=torch.float16
-    )
     
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        device_map='auto',
-        torch_dtype=torch.float16
-    )
+    # Configure model loading to handle HF hub models
+    load_kwargs = {
+        'torch_dtype': torch.float16,
+        'device_map': 'auto',
+        'trust_remote_code': True,
+    }
     
-    contributions = {}
+    # Add token for HF Hub if needed (base model might be from Hub)
+    if '/' in base_model_path and not os.path.isdir(base_model_path):
+        token = os.environ.get('HUGGING_FACE_HUB_TOKEN') or os.environ.get('HF_TOKEN')
+        if token:
+            print('Using HF token for base model download')
+            load_kwargs['token'] = token
     
-    # Analyze each layer
-    print('Analyzing merged model contributions...')
-    for name, param in merged.named_parameters():
-        if not ('weight' in name or 'bias' in name):
-            continue
+    try:
+        # Load merged model
+        print(f'Loading merged model: {merged_model_path}')
+        merged = AutoModelForCausalLM.from_pretrained(merged_model_path, **load_kwargs)
+        
+        # Load base model
+        print(f'Loading base model: {base_model_path}')
+        base = AutoModelForCausalLM.from_pretrained(base_model_path, **load_kwargs)
+        
+        # Initialize contribution dictionary
+        contributions = {}
+        
+        # Analyze each layer
+        print('Analyzing layer contributions...')
+        for name, param in merged.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # Only process parameters that exist in both models
+            if name not in dict(base.named_parameters()):
+                continue
+                
+            base_param = base.get_parameter(name)
+            delta = param.detach() - base_param.detach()
             
-        base_param = base.get_parameter(name)
-        delta = param - base_param
+            # Calculate alpha: magnitude of change (normalized)
+            alpha = delta.abs().mean().item()
+            
+            # Calculate beta: impact on performance (approximated via sparsity)
+            sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
+            beta = 1.0 - sparsity
+            
+            # Calculate conflict score
+            conflict_score = alpha * beta
+            conflict_type = 'prune' if alpha > beta else 'scale'
+            
+            contributions[name] = {
+                'alpha': float(alpha),
+                'beta': float(beta),
+                'conflict_score': float(conflict_score),
+                'conflict_type': conflict_type
+            }
         
-        # Calculate alpha: magnitude of change (normalized)
-        alpha = delta.abs().mean().item()
+        # Store top conflicted layers for easier access
+        sorted_layers = sorted(
+            [(name, data['conflict_score']) for name, data in contributions.items()],
+            key=lambda x: x[1]
+        )
+        contributions['_top_conflicts'] = [name for name, _ in sorted_layers[:10]]
         
-        # Calculate beta: impact on performance (approximated via sparsity)
-        # In the Hi-Merging paper, this measures how much the delta affects model output
-        sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
-        beta = 1.0 - sparsity  # Higher beta = more impact
-        
-        # Calculate conflict score
-        # According to Hi-Merging paper, alpha*beta can indicate conflict level
-        # Positive values indicate positive contribution
-        # Negative values would indicate conflicts (not implemented in this approximation)
-        conflict_score = alpha * beta
-        
-        # Determine conflict type (for layer-specific adjustments)
-        # In Hi-Merging: if conflict detected, decide whether to prune or scale
-        conflict_type = 'prune' if alpha > beta else 'scale'
-        
-        contributions[name] = {
-            'alpha': float(alpha),
-            'beta': float(beta),
-            'conflict_score': float(conflict_score),
-            'conflict_type': conflict_type
-        }
-    
-    # Sort layers by conflict score to find the most problematic ones
-    sorted_layers = sorted(
-        [(name, data['conflict_score']) for name, data in contributions.items()],
-        key=lambda x: x[1]
-    )
-    
-    # Store top conflicted layers for easier access
-    contributions['_top_conflicts'] = [name for name, _ in sorted_layers[:10]]
-    
-    print('Saving merge contribution analysis...')
-    with open(output_json, 'w') as f:
-        json.dump(contributions, f, indent=2)
+        print('Saving merge contribution analysis...')
+        with open(output_json, 'w') as f:
+            json.dump(contributions, f, indent=2)
+            
+    except Exception as e:
+        print(f'Error during merge contribution analysis: {e}')
+        raise e
 
 # Run analysis
 analyze_merge_contribution('$MERGED_MODEL', '$BASE_MODEL', '$OUTPUT_JSON')

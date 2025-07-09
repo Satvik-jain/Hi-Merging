@@ -28,53 +28,72 @@ mkdir -p "$(dirname "$OUTPUT_JSON")"
 python3 -c "
 import torch
 import json
+import os
 from transformers import AutoModelForCausalLM
 import numpy as np
 
 def analyze_contribution(model_path, base_model_path, output_json):
     print('Loading models...')
-    # Load models with half precision to save memory
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, 
-        device_map='auto',
-        torch_dtype=torch.float16
-    )
     
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        device_map='auto',
-        torch_dtype=torch.float16
-    )
+    # Configure model loading to handle HF hub models
+    load_kwargs = {
+        'torch_dtype': torch.float16,
+        'device_map': 'auto',
+        'trust_remote_code': True,
+    }
     
-    contributions = {}
+    # Add token for HF Hub if needed (base model might be from Hub)
+    if '/' in base_model_path and not os.path.isdir(base_model_path):
+        token = os.environ.get('HUGGING_FACE_HUB_TOKEN') or os.environ.get('HF_TOKEN')
+        if token:
+            print('Using HF token for base model download')
+            load_kwargs['token'] = token
     
-    # Analyze each layer
-    print('Analyzing layer contributions...')
-    for name, param in model.named_parameters():
-        if not ('weight' in name or 'bias' in name):
-            continue
+    try:
+        # Load fine-tuned model
+        print(f'Loading model: {model_path}')
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        
+        # Load base model
+        print(f'Loading base model: {base_model_path}')
+        base = AutoModelForCausalLM.from_pretrained(base_model_path, **load_kwargs)
+        
+        # Initialize contribution dictionary
+        contributions = {}
+        
+        # Analyze each layer
+        print('Analyzing layer contributions...')
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # Only process parameters that exist in both models
+            if name not in dict(base.named_parameters()):
+                continue
+                
+            base_param = base.get_parameter(name)
+            delta = param.detach() - base_param.detach()
             
-        base_param = base.get_parameter(name)
-        delta = param - base_param
+            # Calculate alpha: magnitude of change (normalized)
+            alpha = delta.abs().mean().item()
+            
+            # Calculate beta: impact on performance (approximated via sparsity)
+            sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
+            beta = 1.0 - sparsity  # Higher beta = more impact
+            
+            contributions[name] = {
+                'alpha': float(alpha),
+                'beta': float(beta),
+                'conflict_score': float(alpha * beta)
+            }
         
-        # Calculate alpha: magnitude of change (normalized)
-        alpha = delta.abs().mean().item()
-        
-        # Calculate beta: impact on performance (approximated via sparsity)
-        # In the Hi-Merging paper, this measures how much the delta affects model output
-        # Here we use sparsity as a proxy measure
-        sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
-        beta = 1.0 - sparsity  # Higher beta = more impact
-        
-        contributions[name] = {
-            'alpha': float(alpha),
-            'beta': float(beta),
-            'conflict_score': float(alpha * beta)
-        }
-    
-    print('Saving contribution analysis...')
-    with open(output_json, 'w') as f:
-        json.dump(contributions, f, indent=2)
+        print('Saving contribution analysis...')
+        with open(output_json, 'w') as f:
+            json.dump(contributions, f, indent=2)
+            
+    except Exception as e:
+        print(f'Error during contribution analysis: {e}')
+        raise e
 
 # Run analysis
 analyze_contribution('$MODEL_PATH', '$BASE_MODEL', '$OUTPUT_JSON')
