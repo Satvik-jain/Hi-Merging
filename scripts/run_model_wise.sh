@@ -1,25 +1,53 @@
-for density in $(seq 0.1 0.1 1.0); do
-  for weight in $(seq 0.1 0.1 1.0); do
-    # Change directory to mergekit
-    cd /data/user/PycharmProjects/mergekit
+#!/bin/bash
+# run_model_wise.sh - Applies initial pruning and scaling to a model
+#
+# Usage: ./run_model_wise.sh <model_path> <base_model> <output_path> <scale> <density>
 
-    # Update the value of 'density'
-    sed -i "s/density: .*/density: $density/" ./examples/ties.yml
+set -e  # Exit on error
 
-    # Update the value of 'weight'
-    sed -i "s/weight: .*/weight: $weight/" ./examples/ties.yml
+MODEL_PATH="$1"
+BASE_MODEL="$2"
+OUTPUT_PATH="$3"
+SCALE="$4"
+DENSITY="$5"
 
-    # Execute merge command
-    mergekit-yaml ./examples/ties.yml ./output_model/qwen2_lora_sft/merge_en_zh --allow-crimes --cuda
+# Check if all arguments are provided
+if [ -z "$MODEL_PATH" ] || [ -z "$BASE_MODEL" ] || [ -z "$OUTPUT_PATH" ] || [ -z "$SCALE" ] || [ -z "$DENSITY" ]; then
+    echo "Error: Missing required arguments"
+    echo "Usage: ./run_model_wise.sh <model_path> <base_model> <output_path> <scale> <density>"
+    exit 1
+fi
 
-    # Change directory to LLaMA-Factory
-    cd /data/user/PycharmProjects/LLaMA-Factory
+echo "[Info] Running model-wise pruning and scaling with:"
+echo "  - Model: $MODEL_PATH"
+echo "  - Base model: $BASE_MODEL" 
+echo "  - Output path: $OUTPUT_PATH"
+echo "  - Scale: $SCALE"
+echo "  - Density: $DENSITY"
 
-    # Update the 'output_dir' value
-    output_dir="/data/user/PycharmProjects/LLaMA-Factory/saves/qwen2-7b/lora/predict/merge-p-en-${density}-${weight}"
-    sed -i "s|output_dir:.*|output_dir: $output_dir|" ./examples/train_lora/qwen2_lora_predict.yaml
+# Create output directory
+mkdir -p "$OUTPUT_PATH"
 
-    # Run the training command
-    llamafactory-cli train ./examples/train_lora/qwen2_lora_predict.yaml
-  done
-done
+# Create temporary YAML config file for mergekit
+TEMP_CONFIG="$(dirname "$OUTPUT_PATH")/temp_model_wise_config.yml"
+cat > "$TEMP_CONFIG" << EOL
+merge_method: ties
+base_model: $BASE_MODEL
+models:
+  - model: $MODEL_PATH
+    parameters:
+      weight: $SCALE
+      density: $DENSITY
+dtype: float16
+tokenizer:
+  source: base
+EOL
+
+# Run mergekit
+echo "[Info] Running mergekit to apply model-wise pruning and scaling..."
+CUDA_VISIBLE_DEVICES=0,1,2,3 mergekit-yaml "$TEMP_CONFIG" "$OUTPUT_PATH" --allow-crimes --cuda
+
+# Clean up
+rm "$TEMP_CONFIG"
+
+echo "[Success] Model-wise pruning and scaling complete. Output saved to $OUTPUT_PATH"

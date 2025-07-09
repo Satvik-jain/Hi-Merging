@@ -1,121 +1,103 @@
 #!/bin/bash
+# run_merge_contribution.sh - Calculate contributions after merging
+#
+# Usage: ./run_merge_contribution.sh <merged_model> <base_model> <output_json>
 
-# ------------------------
-# 1) Basic Settings
-# ------------------------
+set -e  # Exit on error
 
-# Path of the YAML file to process
-TIES_YML="/data/user/PycharmProjects/mergekit/examples/ties.yml"
+MERGED_MODEL="$1"
+BASE_MODEL="$2"
+OUTPUT_JSON="$3"
 
-# YAML configuration for training
-LLAMA_YML="/data/user/PycharmProjects/LLaMA-Factory/examples/train_lora/qwen2_lora_predict.yaml"
-
-# Output directory prefix (suffix will be automatically added during iteration)
-OUTPUT_DIR_PREFIX="saves/qwen2-7b/lora/predict/en_iteration_"
-
-# Root directories for MergeKit and LLaMA-Factory projects
-MERGEKIT_DIR="/data/user/PycharmProjects/mergekit"
-LLAMAFACTORY_DIR="/data/user/PycharmProjects/LLaMA-Factory"
-
-# Length of the weight array (number of iterations to loop through)
-NUM_POSITIONS=28
-
-# ------------------------
-# 2) Backup Files
-# ------------------------
-echo "[Info] Backing up original configuration files..."
-cp "$TIES_YML" "${TIES_YML}.orig"
-cp "$LLAMA_YML" "${LLAMA_YML}.orig"
-
-# ------------------------
-# 3) Find the corresponding lines of weights for 'en' and 'cmexam'
-#    (Assume stable yml structure, first locate the model line, then search for 'weight:')
-# ------------------------
-
-# Locate the line number for "qwen2_lora_sft/en"
-EN_LINE=$(grep -n -m1 'qwen2_lora_sft/en' "$TIES_YML" | cut -d':' -f1)
-if [ -z "$EN_LINE" ]; then
-  echo "[Error] Could not find configuration for EN model (qwen2_lora_sft/en)"
-  exit 1
+# Check if all arguments are provided
+if [ -z "$MERGED_MODEL" ] || [ -z "$BASE_MODEL" ] || [ -z "$OUTPUT_JSON" ]; then
+    echo "Error: Missing required arguments"
+    echo "Usage: ./run_merge_contribution.sh <merged_model> <base_model> <output_json>"
+    exit 1
 fi
 
-# Find the line number for 'weight:' below EN_LINE
-EN_WEIGHT_LINE=$(awk -v mline="$EN_LINE" 'NR > mline && /weight:/ {print NR; exit}' "$TIES_YML")
-if [ -z "$EN_WEIGHT_LINE" ]; then
-  echo "[Error] Could not find weight line for EN model"
-  exit 1
-fi
+echo "[Info] Calculating contribution for merged model:"
+echo "  - Merged model: $MERGED_MODEL"
+echo "  - Base model: $BASE_MODEL"
+echo "  - Output JSON: $OUTPUT_JSON"
 
-# Locate the line number for "qwen2_lora_sft/cmexam"
-CMEXAM_LINE=$(grep -n -m1 'qwen2_lora_sft/cmexam' "$TIES_YML" | cut -d':' -f1)
-if [ -z "$CMEXAM_LINE" ]; then
-  echo "[Error] Could not find configuration for CMEXAM model (qwen2_lora_sft/cmexam)"
-  exit 1
-fi
+# Ensure output directory exists
+mkdir -p "$(dirname "$OUTPUT_JSON")"
 
-# Find the line number for 'weight:' below CMEXAM_LINE
-CMEXAM_WEIGHT_LINE=$(awk -v mline="$CMEXAM_LINE" 'NR > mline && /weight:/ {print NR; exit}' "$TIES_YML")
-if [ -z "$CMEXAM_WEIGHT_LINE" ]; then
-  echo "[Error] Could not find weight line for CMEXAM model"
-  exit 1
-fi
+# Calculate contributions using Python
+python3 -c "
+import torch
+import json
+from transformers import AutoModelForCausalLM
+import numpy as np
 
-# ------------------------
-# 4) Loop to modify ties.yml, execute merging and training
-# ------------------------
-for ((i=1; i<=NUM_POSITIONS; i++)); do
-  echo "------------------------------"
-  echo "[Info] Starting iteration $i..."
-  echo "------------------------------"
+def analyze_merge_contribution(merged_model_path, base_model_path, output_json):
+    print('Loading models...')
+    # Load models with half precision to save memory
+    merged = AutoModelForCausalLM.from_pretrained(
+        merged_model_path, 
+        device_map='auto',
+        torch_dtype=torch.float16
+    )
+    
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        device_map='auto',
+        torch_dtype=torch.float16
+    )
+    
+    contributions = {}
+    
+    # Analyze each layer
+    print('Analyzing merged model contributions...')
+    for name, param in merged.named_parameters():
+        if not ('weight' in name or 'bias' in name):
+            continue
+            
+        base_param = base.get_parameter(name)
+        delta = param - base_param
+        
+        # Calculate alpha: magnitude of change (normalized)
+        alpha = delta.abs().mean().item()
+        
+        # Calculate beta: impact on performance (approximated via sparsity)
+        # In the Hi-Merging paper, this measures how much the delta affects model output
+        sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
+        beta = 1.0 - sparsity  # Higher beta = more impact
+        
+        # Calculate conflict score
+        # According to Hi-Merging paper, alpha*beta can indicate conflict level
+        # Positive values indicate positive contribution
+        # Negative values would indicate conflicts (not implemented in this approximation)
+        conflict_score = alpha * beta
+        
+        # Determine conflict type (for layer-specific adjustments)
+        # In Hi-Merging: if conflict detected, decide whether to prune or scale
+        conflict_type = 'prune' if alpha > beta else 'scale'
+        
+        contributions[name] = {
+            'alpha': float(alpha),
+            'beta': float(beta),
+            'conflict_score': float(conflict_score),
+            'conflict_type': conflict_type
+        }
+    
+    # Sort layers by conflict score to find the most problematic ones
+    sorted_layers = sorted(
+        [(name, data['conflict_score']) for name, data in contributions.items()],
+        key=lambda x: x[1]
+    )
+    
+    # Store top conflicted layers for easier access
+    contributions['_top_conflicts'] = [name for name, _ in sorted_layers[:10]]
+    
+    print('Saving merge contribution analysis...')
+    with open(output_json, 'w') as f:
+        json.dump(contributions, f, indent=2)
 
-  # Restore original ties.yml for each iteration
-  cp "${TIES_YML}.orig" "$TIES_YML"
+# Run analysis
+analyze_merge_contribution('$MERGED_MODEL', '$BASE_MODEL', '$OUTPUT_JSON')
+print('Merge contribution analysis complete!')
+"
 
-  # ------------------------
-  # 4.1) Modify ties.yml
-  # 
-  # For the i-th iteration:
-  #  - Replace the i-th occurrence of "0.0" in EN weight array with "0.5"
-  #  - Replace the i-th occurrence of "0.0" in CMEXAM weight array with "0.5"
-  # 
-  # Note the sed syntax "s/old/new/N" means replacing the N-th occurrence of 'old'
-  # ------------------------
-  sed -i "${EN_WEIGHT_LINE}s/0.0/0.5/${i}" "$TIES_YML"
-  sed -i "${CMEXAM_WEIGHT_LINE}s/0.0/0.5/${i}" "$TIES_YML"
-
-  # ------------------------
-  # 4.2) Update output directory in qwen2_lora_predict.yaml
-  # ------------------------
-  cp "${LLAMA_YML}.orig" "$LLAMA_YML"
-  THIS_OUTPUT_DIR="${OUTPUT_DIR_PREFIX}${i}"
-  sed -i "s|^output_dir:.*|output_dir: ${THIS_OUTPUT_DIR}|" "$LLAMA_YML"
-
-  # ------------------------
-  # 4.3) Execute MergeKit
-  # ------------------------
-  echo "[Info] Executing MergeKit..."
-  cd "$MERGEKIT_DIR" || exit 1
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 mergekit-yaml \
-    ./examples/ties.yml \
-    ./output_model/qwen2_lora_sft/merge_en_zh \
-    --allow-crimes --cuda
-
-  # ------------------------
-  # 4.4) Execute LLaMA-Factory training
-  # ------------------------
-  echo "[Info] Executing LLaMA-Factory training..."
-  cd "$LLAMAFACTORY_DIR" || exit 1
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 llamafactory-cli train \
-    examples/train_lora/qwen2_lora_predict.yaml
-
-  echo "[Info] Iteration $i completed."
-done
-
-# ------------------------
-# 5) Restore original files
-# ------------------------
-echo "[Info] All iterations completed. Restoring original configuration files."
-cp "${TIES_YML}.orig" "$TIES_YML"
-cp "${LLAMA_YML}.orig" "$LLAMA_YML"
-
-echo "[Done] Script execution finished."
+echo "[Success] Merge contribution analysis complete. Results saved to $OUTPUT_JSON"

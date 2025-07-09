@@ -1,61 +1,84 @@
 #!/bin/bash
+# run_single_contribution.sh - Calculate single model contribution
+#
+# Usage: ./run_single_contribution.sh <model_path> <base_model> <output_json>
 
-# Base Directory
-BASE_DIR="/data/user/PycharmProjects"
+set -e  # Exit on error
 
-# Number of positions in the density list
-NUM_POSITIONS=28
+MODEL_PATH="$1"
+BASE_MODEL="$2"
+OUTPUT_JSON="$3"
 
-# File Paths
-TIES_YML="$BASE_DIR/mergekit/examples/ties.yml"
-LLAMA_YML="$BASE_DIR/LLaMA-Factory/examples/train_lora/qwen2_lora_predict.yaml"
-
-# Backup original files
-cp "$TIES_YML" "${TIES_YML}.orig"
-cp "$LLAMA_YML" "${LLAMA_YML}.orig"
-
-# Get the line number of the cmedqa2-30k model
-model_line=$(grep -n -m1 'cmexam' "$TIES_YML" | cut -d':' -f1)
-if [ -z "$model_line" ]; then
-  echo "Error: Could not find cmexam model in ties.yml"
-  exit 1
+# Check if all arguments are provided
+if [ -z "$MODEL_PATH" ] || [ -z "$BASE_MODEL" ] || [ -z "$OUTPUT_JSON" ]; then
+    echo "Error: Missing required arguments"
+    echo "Usage: ./run_single_contribution.sh <model_path> <base_model> <output_json>"
+    exit 1
 fi
 
-# Get the line number of the density list under cmedqa2-30k
-density_line=$(awk -v mline="$model_line" 'NR > mline && /weight:/ {print NR; exit}' "$TIES_YML")
-if [ -z "$density_line" ]; then
-  echo "Error: Could not find density line under cmedqa2-30k in ties.yml"
-  exit 1
-fi
+echo "[Info] Calculating contribution for single model:"
+echo "  - Model: $MODEL_PATH"
+echo "  - Base model: $BASE_MODEL"
+echo "  - Output JSON: $OUTPUT_JSON"
 
-for ((i=1; i<=NUM_POSITIONS; i++)); do
-  echo "Processing iteration $i..."
+# Ensure output directory exists
+mkdir -p "$(dirname "$OUTPUT_JSON")"
 
-  # Restore original ties.yml at the start of each iteration
-  cp "${TIES_YML}.orig" "$TIES_YML"
+# Calculate contributions using Python
+python3 -c "
+import torch
+import json
+from transformers import AutoModelForCausalLM
+import numpy as np
 
-  # Modify the density list in ties.yml
-  # Replace the i-th occurrence of 0.8 with 0.4
-  sed -i "${density_line}s/\(0\.0\)/1.0/${i}" "$TIES_YML"
+def analyze_contribution(model_path, base_model_path, output_json):
+    print('Loading models...')
+    # Load models with half precision to save memory
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, 
+        device_map='auto',
+        torch_dtype=torch.float16
+    )
+    
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        device_map='auto',
+        torch_dtype=torch.float16
+    )
+    
+    contributions = {}
+    
+    # Analyze each layer
+    print('Analyzing layer contributions...')
+    for name, param in model.named_parameters():
+        if not ('weight' in name or 'bias' in name):
+            continue
+            
+        base_param = base.get_parameter(name)
+        delta = param - base_param
+        
+        # Calculate alpha: magnitude of change (normalized)
+        alpha = delta.abs().mean().item()
+        
+        # Calculate beta: impact on performance (approximated via sparsity)
+        # In the Hi-Merging paper, this measures how much the delta affects model output
+        # Here we use sparsity as a proxy measure
+        sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
+        beta = 1.0 - sparsity  # Higher beta = more impact
+        
+        contributions[name] = {
+            'alpha': float(alpha),
+            'beta': float(beta),
+            'conflict_score': float(alpha * beta)
+        }
+    
+    print('Saving contribution analysis...')
+    with open(output_json, 'w') as f:
+        json.dump(contributions, f, indent=2)
 
-  # Modify llama3_lora_predict.yaml
-  cp "${LLAMA_YML}.orig" "$LLAMA_YML"
-  OUTPUT_DIR="saves/qwen2-7b/lora/predict/cmexam_iteration_$i"
-  sed -i "s|^output_dir:.*|output_dir: $OUTPUT_DIR|" "$LLAMA_YML"
+# Run analysis
+analyze_contribution('$MODEL_PATH', '$BASE_MODEL', '$OUTPUT_JSON')
+print('Contribution analysis complete!')
+"
 
-  # Run mergekit-yaml command
-  cd "$BASE_DIR/mergekit"
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 mergekit-yaml ./examples/ties.yml ./output_model/qwen2_lora_sft/merge_en_zh --allow-crimes --cuda
-
-  # Run llamafactory-cli train command
-  cd "$BASE_DIR/LLaMA-Factory"
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 llamafactory-cli train examples/train_lora/qwen2_lora_predict.yaml
-
-  echo "Iteration $i completed."
-done
-
-# Restore original files after all iterations
-cp "${TIES_YML}.orig" "$TIES_YML"
-cp "${LLAMA_YML}.orig" "$LLAMA_YML"
-
-echo "All iterations completed."
+echo "[Success] Contribution analysis complete. Results saved to $OUTPUT_JSON"
