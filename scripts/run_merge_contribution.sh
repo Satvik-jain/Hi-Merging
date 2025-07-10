@@ -24,65 +24,74 @@ echo "  - Output JSON: $OUTPUT_JSON"
 # Ensure output directory exists
 mkdir -p "$(dirname "$OUTPUT_JSON")"
 
-# Calculate contributions using Python
-python3 -c "
+# Create a temporary Python file for better error handling
+TMP_PY_FILE="/tmp/run_merge_contribution_$$.py"
+cat > "$TMP_PY_FILE" << 'EOL'
 import torch
 import json
 import os
+import sys
 from transformers import AutoModelForCausalLM
-import numpy as np
+import traceback
 
 def analyze_merge_contribution(merged_model_path, base_model_path, output_json):
-    print('Loading models...')
-    
-    # Configure model loading to handle HF hub models
-    load_kwargs = {
-        'torch_dtype': torch.float16,
-        'device_map': 'auto',
-        'trust_remote_code': True,
-    }
-    
-    # Add token for HF Hub if needed (base model might be from Hub)
-    if '/' in base_model_path and not os.path.isdir(base_model_path):
-        token = os.environ.get('HUGGING_FACE_HUB_TOKEN') or os.environ.get('HF_TOKEN')
-        if token:
-            print('Using HF token for base model download')
-            load_kwargs['token'] = token
-    
     try:
+        print(f'Loading models for merge contribution analysis')
+        
+        # Set environment variables for HuggingFace
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+        
+        # Get HF token from environment
+        token = os.environ.get('HUGGING_FACE_HUB_TOKEN') or os.environ.get('HF_TOKEN')
+        print(f'HF token available: {"Yes" if token else "No"}')
+        
+        # Create dummy contribution to ensure we can write output
+        dummy_contribution = {"status": "loading models"}
+        with open(output_json, 'w') as f:
+            json.dump(dummy_contribution, f)
+        
         # Load merged model
         print(f'Loading merged model: {merged_model_path}')
-        merged = AutoModelForCausalLM.from_pretrained(merged_model_path, **load_kwargs)
+        model_kwargs = {
+            "device_map": "auto",
+            "torch_dtype": torch.float16,
+            "trust_remote_code": True,
+            "use_auth_token": token
+        }
+        merged = AutoModelForCausalLM.from_pretrained(merged_model_path, **model_kwargs)
         
-        # Load base model
+        # Load base model - use same arguments
         print(f'Loading base model: {base_model_path}')
-        base = AutoModelForCausalLM.from_pretrained(base_model_path, **load_kwargs)
+        base = AutoModelForCausalLM.from_pretrained(base_model_path, **model_kwargs)
         
-        # Initialize contribution dictionary
+        # Calculate contributions
+        print('Analyzing merged model contributions...')
         contributions = {}
         
-        # Analyze each layer
-        print('Analyzing layer contributions...')
         for name, param in merged.named_parameters():
-            if not param.requires_grad:
+            if not ('weight' in name or 'bias' in name):
                 continue
                 
-            # Only process parameters that exist in both models
+            # Skip if parameter doesn't exist in base model
             if name not in dict(base.named_parameters()):
+                print(f"Skipping {name} - not in base model")
                 continue
                 
             base_param = base.get_parameter(name)
             delta = param.detach() - base_param.detach()
             
-            # Calculate alpha: magnitude of change (normalized)
+            # Calculate alpha: magnitude of change
             alpha = delta.abs().mean().item()
             
-            # Calculate beta: impact on performance (approximated via sparsity)
+            # Calculate beta: approximated by sparsity
             sparsity = (delta.abs() < delta.abs().mean()).float().mean().item()
             beta = 1.0 - sparsity
             
             # Calculate conflict score
             conflict_score = alpha * beta
+            
+            # Determine if this layer needs pruning or scaling
             conflict_type = 'prune' if alpha > beta else 'scale'
             
             contributions[name] = {
@@ -92,24 +101,57 @@ def analyze_merge_contribution(merged_model_path, base_model_path, output_json):
                 'conflict_type': conflict_type
             }
         
-        # Store top conflicted layers for easier access
+        # Sort layers by conflict score to find most problematic ones
         sorted_layers = sorted(
-            [(name, data['conflict_score']) for name, data in contributions.items()],
+            [(name, contributions[name]['conflict_score']) for name in contributions],
             key=lambda x: x[1]
         )
+        
+        # Add top conflicts for easy reference
         contributions['_top_conflicts'] = [name for name, _ in sorted_layers[:10]]
         
-        print('Saving merge contribution analysis...')
+        print(f'Saving merge contribution analysis to {output_json}...')
         with open(output_json, 'w') as f:
             json.dump(contributions, f, indent=2)
-            
+        
+        print('Merge contribution analysis completed successfully')
+        return 0
+        
     except Exception as e:
-        print(f'Error during merge contribution analysis: {e}')
-        raise e
+        print(f"ERROR: Exception during merge contribution analysis: {e}")
+        traceback.print_exc()
+        
+        # Write error to output file so it doesn't get lost
+        with open(output_json, 'w') as f:
+            json.dump({"error": str(e), "traceback": traceback.format_exc()}, f, indent=2)
+        
+        return 1
 
-# Run analysis
-analyze_merge_contribution('$MERGED_MODEL', '$BASE_MODEL', '$OUTPUT_JSON')
-print('Merge contribution analysis complete!')
-"
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print("Usage: python script.py <merged_model_path> <base_model_path> <output_json>")
+        sys.exit(1)
+    
+    merged_model_path = sys.argv[1]
+    base_model_path = sys.argv[2]
+    output_json = sys.argv[3]
+    
+    exit_code = analyze_merge_contribution(merged_model_path, base_model_path, output_json)
+    sys.exit(exit_code)
+EOL
 
-echo "[Success] Merge contribution analysis complete. Results saved to $OUTPUT_JSON"
+# Run the Python script with proper error handling
+echo "[Info] Running merge contribution analysis..."
+python3 "$TMP_PY_FILE" "$MERGED_MODEL" "$BASE_MODEL" "$OUTPUT_JSON"
+RESULT=$?
+
+# Clean up
+rm "$TMP_PY_FILE"
+
+if [ $RESULT -eq 0 ]; then
+    echo "[Success] Merge contribution analysis completed. Results saved to $OUTPUT_JSON"
+    exit 0
+else
+    echo "[Error] Merge contribution analysis failed. Check $OUTPUT_JSON for details."
+    exit 1
+fi
