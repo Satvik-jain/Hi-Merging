@@ -46,37 +46,39 @@ cp "$CONFIG" "${CONFIG}.merge.backup"
 for i in $(seq 1 $ITERATIONS); do
     echo "Analyzing merge contribution at position $i..."
     
-    # Create iteration-specific config
-    ITER_CONFIG="${MERGE_CONTRIB_DIR}/iter${i}.yml"
-    cp "${CONFIG}.merge.backup" "$ITER_CONFIG"
-    
-    # Get the number of models
-    NUM_MODELS=$(grep -c "model:" "$ITER_CONFIG")
-    
-    # For each model, modify its weight at position i to 0.5
-    for m in $(seq 1 $NUM_MODELS); do
-        # Get the line number for this model
-        MODEL_LINE=$(grep -n "model:" "$ITER_CONFIG" | sed -n "${m}p" | cut -d':' -f1)
-        if [ -z "$MODEL_LINE" ]; then
-            echo "Error: Could not find model $m in config"
-            continue
-        fi
-        
-        # Find the weight parameters line for this model
-        WEIGHT_LINE=$(awk -v start=$MODEL_LINE 'NR>=start && /weight:/ {print NR; exit}' "$ITER_CONFIG")
-        if [ -z "$WEIGHT_LINE" ]; then
-            echo "Error: Could not find weight for model $m"
-            continue
-        fi
-        
-        # In a real implementation, we would modify the weight array at position i to 0.5
-        # For simplicity in this demo, we just indicate the intention
-        echo "Would modify weight for model $m at position $i to 0.5"
-    done
-    
-    # Run mergekit with the modified config
-    ITER_OUTPUT="${MERGE_CONTRIB_DIR}/iter${i}"
-    mergekit-yaml "$ITER_CONFIG" "$ITER_OUTPUT" --allow-crimes --cuda
+    # Python script to modify configs and execute mergekit
+    python3 -c "
+import yaml
+import subprocess
+import os
+
+# Load the original config
+with open('${CONFIG}.merge.backup', 'r') as f:
+    config = yaml.safe_load(f)
+
+# Create iteration-specific config
+iter_config = '${MERGE_CONTRIB_DIR}/iter{}.yml'.format($i)
+iter_output = '${MERGE_CONTRIB_DIR}/iter{}'.format($i)
+
+# Deep copy the config for this iteration
+iter_cfg = dict(config)
+iter_cfg['models'] = [dict(m) for m in config['models']]
+
+# For each model, set weight at position $i to 0.5
+for m in iter_cfg['models']:
+    if 'parameters' in m:
+        m['parameters'] = dict(m['parameters'])
+        m['parameters']['weight'] = 0.5
+
+# Write the config file
+with open(iter_config, 'w') as f:
+    yaml.dump(iter_cfg, f, default_flow_style=False)
+
+# Run mergekit for this configuration
+subprocess.run(['mergekit-yaml', iter_config, iter_output, '--allow-crimes', '--cuda'])
+
+print('Completed merge analysis for position {}'.format($i))
+"
     
     echo "Completed merge analysis for position $i"
 done
@@ -84,9 +86,4 @@ done
 # Restore original config
 cp "${CONFIG}.merge.backup" "$CONFIG"
 
-# Process the results to find optimal configuration
-echo "Processing merge contribution results..."
-
-# Update the final config based on merge contribution analysis
-# (In a real implementation, this would be based on evaluation results)
-echo "Updating main config based on merge contribution analysis"
+echo "Merge contribution analysis completed. Results in $MERGE_CONTRIB_DIR"

@@ -37,18 +37,18 @@ fi
 TEMP_DIR="${OUTPUT}/model_wise_experiments"
 mkdir -p "$TEMP_DIR"
 
-# Calculate density and weight step based on iterations
-DENSITY_STEP=$(echo "scale=2; 1.0/$ITERATIONS" | bc)
-WEIGHT_STEP=$(echo "scale=2; 1.0/$ITERATIONS" | bc)
+# Calculate density and weight step using Python instead of bc
+DENSITY_STEP=$(python3 -c "print(round(1.0/$ITERATIONS, 2))")
+WEIGHT_STEP=$(python3 -c "print(round(1.0/$ITERATIONS, 2))")
 
 echo "Starting model-wise pruning and scaling experiments..."
 echo "Using density step: $DENSITY_STEP, weight step: $WEIGHT_STEP"
 
 # Start with lower densities (more pruning) and gradually increase
 for i in $(seq 1 $ITERATIONS); do
-    DENSITY=$(echo "scale=2; $i*$DENSITY_STEP" | bc)
+    DENSITY=$(python3 -c "print(round($i*$DENSITY_STEP, 2))")
     for j in $(seq 1 $ITERATIONS); do
-        WEIGHT=$(echo "scale=2; $j*$WEIGHT_STEP" | bc)
+        WEIGHT=$(python3 -c "print(round($j*$WEIGHT_STEP, 2))")
         
         echo "Running experiment with density=$DENSITY, weight=$WEIGHT"
         
@@ -56,34 +56,36 @@ for i in $(seq 1 $ITERATIONS); do
         EXP_CONFIG="${TEMP_DIR}/config_d${DENSITY}_w${WEIGHT}.yml"
         cp "$CONFIG" "$EXP_CONFIG"
         
-        # Update the density and weight values in all models
-        for MODEL_IDX in $(grep -n "model:" "$EXP_CONFIG" | cut -d':' -f1); do
-            # Find the parameters section below this model
-            PARAMS_LINE=$((MODEL_IDX + 1))
-            WEIGHT_LINE=$(awk -v start=$PARAMS_LINE 'NR>=start && /weight:/ {print NR; exit}' "$EXP_CONFIG")
-            DENSITY_LINE=$(awk -v start=$PARAMS_LINE 'NR>=start && /density:/ {print NR; exit}' "$EXP_CONFIG")
-            
-            if [ -n "$WEIGHT_LINE" ] && [ -n "$DENSITY_LINE" ]; then
-                # Update the weight and density values
-                sed -i "${WEIGHT_LINE}s/weight:.*/weight: $WEIGHT/" "$EXP_CONFIG"
-                sed -i "${DENSITY_LINE}s/density:.*/density: $DENSITY/" "$EXP_CONFIG"
-            fi
-        done
+        # Update density and weight values using Python
+        python3 -c "
+import yaml
+
+with open('$EXP_CONFIG', 'r') as f:
+    config = yaml.safe_load(f)
+
+# Update all models
+for model in config['models']:
+    if 'parameters' in model:
+        model['parameters']['density'] = $DENSITY
+        model['parameters']['weight'] = $WEIGHT
+
+with open('$EXP_CONFIG', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False)
+"
         
         # Run mergekit with the updated config
         EXP_OUTPUT="${TEMP_DIR}/merge_d${DENSITY}_w${WEIGHT}"
         mergekit-yaml "$EXP_CONFIG" "$EXP_OUTPUT" --allow-crimes --cuda
         
-        # Optionally run evaluation here to find optimal values
-        # For now, we'll just save the parameters with the merged model
+        # Save parameters with the merged model
         echo "{ \"density\": $DENSITY, \"weight\": $WEIGHT }" > "${EXP_OUTPUT}/params.json"
     done
 done
 
 echo "Model-wise experiments completed. Results in $TEMP_DIR"
 
-# Find the best performing model based on evaluation (placeholder)
-# In a real implementation, you would analyze evaluation results
+# Find the best performing model based on evaluation
+# In a real implementation, this would analyze evaluation results
 BEST_CONFIG="${TEMP_DIR}/best_config.yml"
 cp "$CONFIG" "$BEST_CONFIG"
 

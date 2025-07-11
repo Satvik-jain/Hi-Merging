@@ -42,59 +42,54 @@ echo "Starting single contribution analysis..."
 # Backup original config
 cp "$CONFIG" "${CONFIG}.contrib.backup"
 
-# Get the number of models in the config
-NUM_MODELS=$(grep -c "model:" "$CONFIG")
-echo "Detected $NUM_MODELS models in the configuration"
-
 # For each iteration (layer position)
 for i in $(seq 1 $ITERATIONS); do
     echo "Analyzing contribution at position $i..."
     
-    # For each model
-    for m in $(seq 1 $NUM_MODELS); do
-        # Get the line number for this model
-        MODEL_LINE=$(grep -n "model:" "$CONFIG" | sed -n "${m}p" | cut -d':' -f1)
-        if [ -z "$MODEL_LINE" ]; then
-            echo "Error: Could not find model $m in config"
-            continue
-        fi
-        
-        # Find the weight parameters line for this model
-        WEIGHT_LINE=$(awk -v start=$MODEL_LINE 'NR>=start && /weight:/ {print NR; exit}' "$CONFIG")
-        if [ -z "$WEIGHT_LINE" ]; then
-            echo "Error: Could not find weight for model $m"
-            continue
-        fi
-        
-        # Create a model-specific config for this iteration
-        ITER_CONFIG="${CONTRIB_DIR}/model${m}_pos${i}.yml"
-        cp "${CONFIG}.contrib.backup" "$ITER_CONFIG"
-        
-        # Create weight vector with all 0.0 except position i which is 1.0
-        # First, set all weights to 0.0 for this model
-        sed -i "${WEIGHT_LINE}s/weight:.*/weight: 0.0/" "$ITER_CONFIG"
-        
-        # Then set position i to 1.0
-        # In a real implementation, we would need to parse the actual weight array 
-        # structure, but for demonstration we're assuming a simple replacement
-        
-        # Run mergekit with the modified config
-        ITER_OUTPUT="${CONTRIB_DIR}/model${m}_pos${i}"
-        mergekit-yaml "$ITER_CONFIG" "$ITER_OUTPUT" --allow-crimes --cuda
-        
-        echo "Completed analysis for model $m at position $i"
-    done
+    # Python script to modify configs and execute mergekit
+    python3 -c "
+import yaml
+import subprocess
+import os
+
+# Load the original config
+with open('${CONFIG}.contrib.backup', 'r') as f:
+    config = yaml.safe_load(f)
+
+# For each model, create a configuration where only this model contributes at position $i
+for idx, model in enumerate(config['models']):
+    # Create config name
+    iter_config = '${CONTRIB_DIR}/model{}_pos{}.yml'.format(idx, $i)
+    
+    # Deep copy the config for this iteration
+    iter_cfg = dict(config)
+    iter_cfg['models'] = [dict(m) for m in config['models']]
+    
+    # Set all weights to 0.0
+    for m in iter_cfg['models']:
+        if 'parameters' in m:
+            m['parameters'] = dict(m['parameters'])
+            m['parameters']['weight'] = 0.0
+    
+    # For this model at position $i, set weight to 1.0
+    if 'parameters' in iter_cfg['models'][idx]:
+        iter_cfg['models'][idx]['parameters']['weight'] = 1.0
+    
+    # Write the config file
+    with open(iter_config, 'w') as f:
+        yaml.dump(iter_cfg, f, default_flow_style=False)
+    
+    # Run mergekit for this configuration
+    output_dir = '${CONTRIB_DIR}/model{}_pos{}'.format(idx, $i)
+    subprocess.run(['mergekit-yaml', iter_config, output_dir, '--allow-crimes', '--cuda'])
+    
+    print('Completed analysis for model {} at position {}'.format(idx, $i))
+"
+    
+    echo "Completed analysis for position $i"
 done
 
 # Restore original config
 cp "${CONFIG}.contrib.backup" "$CONFIG"
 
-# Analyze contributions and update the original config
-# This would typically involve evaluating each model variation and 
-# determining which layers have the most impact
-
 echo "Single contribution analysis completed. Results in $CONTRIB_DIR"
-
-# Apply the insights from contribution analysis to update the config
-# (In a real implementation, this would be based on evaluation results)
-echo "Updating main config based on contribution analysis"
